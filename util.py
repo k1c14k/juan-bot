@@ -3,9 +3,6 @@ import os
 
 CONFIG_PATH = os.getenv('CONFIG_PATH') or '~/.config/Juan/config.json'
 
-# if os.getenv('CONFIG_PATH'):
-#     CONFIG_PATH = os.getenv('CONFIG_PATH')
-
 
 def read_config():
     config_path = os.path.expanduser(CONFIG_PATH)

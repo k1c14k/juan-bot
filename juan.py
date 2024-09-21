@@ -1,16 +1,54 @@
 import os
+from asyncio import sleep
+from time import time
 
+from tinydb import TinyDB, Query
 import nextcord
-from nextcord import Interaction
+from nextcord import Interaction, SlashOption
 from nextcord.ext import commands
 from dotenv import load_dotenv
 
-from util import read_config, save_config
+
+class BackgroundIntervalTask:
+    def __init__(self, bot, interval):
+        self.bot = bot
+        self.interval = interval
+        self.bot.loop.create_task(self.task())
+
+
+    async def task(self):
+        await self.bot.wait_until_ready()
+        while not self.bot.is_closed():
+            await self.coro()
+            await sleep(self.interval)
+
+
+    async def coro(self):
+        pass
+
+
+class DailyReminderTask(BackgroundIntervalTask):
+    def __init__(self, bot, interval):
+        super().__init__(bot, interval)
+
+    async def coro(self):
+        my_channel = config.get(Query().key == 'my-channel').get('value')
+        channel = bot.get_channel(my_channel)
+        reminders = daily_reminders.search(Query().next_reminder < time())
+        for reminder in reminders:
+            # send message "Hey @user, do you remember to do X?" to channel
+            await channel.send(f'Hey <@{reminder["user_id"]}>, do you remember to do {reminder["what"]}?')
+            # update next_reminder to next day
+            daily_reminders.update({'next_reminder': time()+4000}, Query().id == int(reminder['id']))
+
 
 if __name__ == '__main__':
     load_dotenv()
-    config = read_config()
-    tasks = {}
+    db = TinyDB(os.getenv('DB_PATH'))
+    tasks = db.table('tasks')
+    users = db.table('users')
+    config = db.table('config')
+    daily_reminders = db.table('daily_reminders')
 
     # Set up the bot with a command prefix, e.g., "!"
     intents = nextcord.Intents(message_content=True, guilds=True)
@@ -28,6 +66,9 @@ if __name__ == '__main__':
         except Exception as e:
             print(f'Error syncing commands: {e}')
 
+        # start the daily reminder task
+        DailyReminderTask(bot, 60)  # check every minute
+
 
     # Command: respond to the !hello command
     @bot.slash_command(name="hello", description='Say hello to the bot', force_global=True)
@@ -40,13 +81,14 @@ if __name__ == '__main__':
 
     @bot.slash_command(name="setch", description='Set my_channel property in config', force_global=True)
     async def setch(interaction: Interaction, channel: nextcord.TextChannel):
-        config['my_channel'] = channel.id
+        config.insert({'key': 'my-channel', 'value': channel.id})
         await interaction.response.send_message(f'my_channel set to {channel.name}', ephemeral=True)
 
 
     @bot.slash_command(name="getch", description='Get my_channel property from config', force_global=True)
     async def getch(interaction: Interaction):
-        channel_id = config.get('my_channel')
+        config_search = config.search(Query().key == 'my-channel')
+        channel_id = config_search[0].get('value') if config_search else None
         if channel_id:
             channel = bot.get_channel(channel_id)
             if channel:
@@ -58,33 +100,55 @@ if __name__ == '__main__':
             await interaction.response.send_message('my_channel is not set', ephemeral=True)
 
 
-    @bot.slash_command(name="save", description='Save the current config to file', force_global=True)
-    async def save(interaction: Interaction):
-        save_config(config)
-        await interaction.response.send_message('Configuration saved', ephemeral=True)
-
-
     @bot.slash_command(name="add_task", description='Add a new task', force_global=True)
     async def add_task(interaction: Interaction, when: str, what: str):
+        my_channel = config.get(Query().key == 'my-channel').get('value')
+        channel = bot.get_channel(my_channel)
         # check if user is in tasks
-        if interaction.user.id not in tasks:
-            tasks[interaction.user.id] = {}
-        if 'msg-id' in tasks[interaction.user.id]:
-            # remove previous message
-            channel = bot.get_channel(config.get('my_channel'))
-            msg = await channel.fetch_message(tasks[interaction.user.id]['msg-id'])
+        user = users.get(Query().id == interaction.user.id)
+        if user:
+            msg = await channel.fetch_message(user['msg-id'])
             await msg.delete()
-        if 'tasks' not in tasks[interaction.user.id]:
-            tasks[interaction.user.id]['tasks'] = []
-        tasks[interaction.user.id]['tasks'].append({'when': when, 'what': what})
+        tasks.insert({'user_id': interaction.user.id, 'when': when, 'what': what})
+        user_tasks = tasks.search(Query().user_id == interaction.user.id)
 
         current_list = 'Twoje taski do wykonania:\n'
-        for idx, task in enumerate(tasks[interaction.user.id]['tasks']):
-            current_list += f'{idx + 1}. {task["when"]} - {task["what"]}\n'
-        channel = bot.get_channel(config.get('my_channel'))
+        for task in user_tasks:
+            current_list += f'{task["when"]} - {task["what"]}\n'
         msg = await channel.send(current_list)
-        tasks[interaction.user.id]['msg-id'] = msg.id
+        user['msg-id'] = msg.id
+        users.upsert(user, Query().id == interaction.user.id)
         await interaction.response.send_message('Task added', ephemeral=True)
 
-# Run the bot with the token from the Discord Developer Portal
+
+    @bot.slash_command(name="daily_reminder", description='Set daily reminder list', force_global=True)
+    async def daily_reminder(interaction: Interaction):
+        pass
+
+
+    @daily_reminder.subcommand(name="add", description='Add a new task to daily reminder list')
+    async def daily_reminder_add(interaction: Interaction, when: int = SlashOption(description="When?"),
+                                 what: str = SlashOption(description="What?")):
+        last_id = daily_reminders.all()[-1].doc_id if daily_reminders.all() else 0
+        daily_reminders.insert({'user_id': interaction.user.id, 'when': when, 'what': what, 'id': last_id + 1,
+                                'next_reminder': time() - 1})
+        await interaction.response.send_message('Task added to daily reminder list', ephemeral=True)
+
+
+    @daily_reminder.subcommand(name="list", description='List daily reminder tasks')
+    async def daily_reminder_list(interaction: Interaction):
+        user_reminders = daily_reminders.search(Query().user_id == interaction.user.id)
+        current_list = 'Twoje przypomnienia:\n'
+        for reminder in user_reminders:
+            current_list += f'#{reminder["id"]} {reminder["when"]} - {reminder["what"]}\n'
+        await interaction.response.send_message(current_list, ephemeral=True)
+
+
+    @daily_reminder.subcommand(name="remove", description='Remove a task from daily reminder list')
+    async def daily_reminder_remove(interaction: Interaction, id: int = SlashOption(description="Id")):
+        daily_reminders.remove(Query().id == id)
+        await interaction.response.send_message('Task removed from daily reminder list', ephemeral=True)
+
+
+    # Run the bot with the token from the Discord Developer Portal
     bot.run(os.getenv('DISCORD_TOKEN'))

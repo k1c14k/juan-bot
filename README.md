@@ -19,6 +19,7 @@ Juan Bot, the task management Discord bot.
 3. Create a .env file with the following content:
 ```
 DISCORD_TOKEN=your_discord_token
+DB_PATH=your_db_path
 ```
 4. Run the bot
 
